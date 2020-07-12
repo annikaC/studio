@@ -1,5 +1,5 @@
 {
-    "name": "annikaC/studio",
+    "name": "annikac/studio",
     "description": "Develop your Composer libraries with style - forked from franzl/studio with some fixes to 0.14",
     "keywords": ["composer", "development", "workflow"],
     "type": "composer-plugin",
