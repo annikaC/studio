@@ -5,11 +5,16 @@ namespace Studio\Composer;
 use Composer\Composer;
 use Composer\EventDispatcher\EventSubscriberInterface;
 use Composer\IO\IOInterface;
+use Composer\Json\JsonFile;
+use Composer\Package\PackageInterface;
 use Composer\Plugin\PluginInterface;
+use Composer\Repository\CompositeRepository;
+use Composer\Repository\InstalledFilesystemRepository;
 use Composer\Repository\PathRepository;
+use Composer\Repository\WritableRepositoryInterface;
 use Composer\Script\ScriptEvents;
+use Composer\Util\Filesystem;
 use Studio\Config\Config;
-use Studio\Config\FileStorage;
 
 class StudioPlugin implements PluginInterface, EventSubscriberInterface
 {
@@ -23,6 +28,16 @@ class StudioPlugin implements PluginInterface, EventSubscriberInterface
      */
     protected $io;
 
+    /**
+     * @var bool
+     */
+    protected $studioPackagesLoaded = false;
+
+    /**
+     * @var array
+     */
+    protected $studioPackages = [];
+
     public function activate(Composer $composer, IOInterface $io)
     {
         $this->composer = $composer;
@@ -31,32 +46,142 @@ class StudioPlugin implements PluginInterface, EventSubscriberInterface
 
     public static function getSubscribedEvents()
     {
+        // TODO: Before update, append Studio path repositories
         return [
-            ScriptEvents::PRE_INSTALL_CMD => 'registerStudioPackages',
-            ScriptEvents::PRE_UPDATE_CMD => 'registerStudioPackages',
+            ScriptEvents::POST_UPDATE_CMD => 'symlinkStudioPackages',
+            ScriptEvents::POST_INSTALL_CMD  => 'symlinkStudioPackages',
+            ScriptEvents::PRE_AUTOLOAD_DUMP => 'loadStudioPackages',
+            ScriptEvents::POST_AUTOLOAD_DUMP => 'revertStudioPackages',
         ];
     }
 
     /**
-     * Register all managed paths with Composer.
+     * Symlink all Studio-managed packages
      *
-     * This function configures Composer to treat all Studio-managed paths as local path repositories, so that packages
-     * therein will be symlinked directly.
+     * After `composer update`, we replace all packages that can also be found
+     * in paths managed by Studio with symlinks to those paths.
      */
-    public function registerStudioPackages()
+    public function symlinkStudioPackages()
     {
-        $repoManager = $this->composer->getRepositoryManager();
+        // Create symlinks for all left-over packages in vendor/composer/studio
+        $destination = $this->composer->getConfig()->get('vendor-dir') . '/composer/studio';
+        (new Filesystem())->emptyDirectory($destination);
+        $studioRepo = new InstalledFilesystemRepository(
+            new JsonFile($destination . '/installed.json')
+        );
+
+        $installationManager = $this->composer->getInstallationManager();
+
+        // Get local repository which contains all installed packages
+        $installed = $this->composer->getRepositoryManager()->getLocalRepository();
+
+        foreach ($this->getManagedPackages() as $package) {
+            $original = $installed->findPackage($package->getName(), '*');
+            $originalPackage = $original instanceof AliasPackage ? $original->getAliasOf() : $original;
+
+            // Change the source type to path, to prevent 'The package has modified files'
+            if ($originalPackage instanceof CompletePackage) {
+              $originalPackage->setInstallationSource('dist');
+              $originalPackage->setDistType('path');
+            }
+
+            $installationManager->getInstaller($original->getType())->uninstall($installed, $original);
+            $installationManager->getInstaller($package->getType())->install($studioRepo, $package);
+        }
+
+        $studioRepo->write();
+
+        // TODO: Run dump-autoload again
+    }
+
+    /**
+     * Swap installed packages with symlinked versions for autoload dump.
+     */
+    public function loadStudioPackages() {
+      $this->registerStudioPackages();
+
+      $this->swapPackages();
+    }
+
+  /**
+   * Revert swapped package versions when autoload dump is complete.
+   */
+  public function revertStudioPackages() {
+    $this->swapPackages(TRUE);
+  }
+  public function registerStudioPackages() {
+    if (!$this->studioPackagesLoaded) {
+      $this->studioPackagesLoaded = TRUE;
+
+      $localRepo = $this->composer->getRepositoryManager()
+        ->getLocalRepository();
+
+      foreach ($this->getManagedPackages() as $package) {
+        $this->write('Loading package ' . $package->getName());
+        $this->studioPackages[$package->getName()] = [
+          'studio' => $package
+        ];
+      }
+      foreach ($localRepo->getCanonicalPackages() as $package) {
+        if (isset($this->studioPackages[$package->getName()])) {
+          $this->studioPackages[$package->getName()]['original'] = $package;
+        }
+      }
+    }
+  }
+
+  /**
+   * Remove original packages from local repository manager and replace with
+   * studio/symlinked packages.
+   *
+   * @param bool $revert Revert flag will undo this change.
+   */
+  protected function swapPackages($revert = false) {
+    $localRepo = $this->composer->getRepositoryManager()->getLocalRepository();
+    foreach ($this->studioPackages as $package) {
+      $localRepo->removePackage($package[$revert ? 'studio' : 'original']);
+      $localRepo->addPackage(clone $package[$revert ? 'original' : 'studio']);
+    }
+  }
+
+    /**
+     * @param WritableRepositoryInterface $installedRepo
+     * @param PathRepository[] $managedRepos
+     * @return PackageInterface[]
+     */
+    private function getIntersection(WritableRepositoryInterface $installedRepo, $managedRepos)
+    {
+        $managedRepo = new CompositeRepository($managedRepos);
+
+        return array_filter(
+            array_map(
+                function (PackageInterface $package) use ($managedRepo) {
+                    return $managedRepo->findPackage($package->getName(), '*');
+                },
+                $installedRepo->getCanonicalPackages()
+            )
+        );
+    }
+
+    private function getManagedPackages()
+    {
         $composerConfig = $this->composer->getConfig();
 
+        // Get array of PathRepository instances for Studio-managed paths
+        $managed = [];
         foreach ($this->getManagedPaths() as $path) {
-            $this->io->writeError("[Studio] Loading path $path");
-
-            $repoManager->prependRepository(new PathRepository(
+            $managed[] = new PathRepository(
                 ['url' => $path],
                 $this->io,
                 $composerConfig
-            ));
+            );
         }
+
+        // Intersect PathRepository packages with local repository
+        return $this->getIntersection(
+            $this->composer->getRepositoryManager()->getLocalRepository(),
+            $managed
+        );
     }
 
     /**
@@ -70,5 +195,10 @@ class StudioPlugin implements PluginInterface, EventSubscriberInterface
         $config = Config::make("{$targetDir}/studio.json");
 
         return $config->getPaths();
+    }
+
+    private function write($msg)
+    {
+        $this->io->write("[Studio] $msg");
     }
 }
